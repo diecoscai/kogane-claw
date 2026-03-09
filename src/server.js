@@ -1640,6 +1640,14 @@ server.on('upgrade', (req, socket, head) => {
             console.log('[ws-proxy] released held connect with server signature, ts:', ts);
             if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.send(JSON.stringify(signed));
           }
+        } else if (msg.type === 'event' && (msg.event === 'hello-ok' || msg.event === 'hello.ok' || msg.event === 'connect.ok' || msg.event === 'connect.success')) {
+          console.log('[ws-proxy] gateway hello-ok:', JSON.stringify(msg));
+        } else if (msg.type === 'res' && msg.method === 'connect') {
+          console.log('[ws-proxy] gateway connect response:', JSON.stringify(msg));
+        } else if (msg.type === 'event' && msg.event && msg.event.startsWith('connect')) {
+          console.log('[ws-proxy] gateway connect event:', msg.event, JSON.stringify(msg.payload || {}));
+        } else if (msg.type === 'event' && msg.event && (msg.event.includes('pair') || msg.event.includes('device'))) {
+          console.log('[ws-proxy] gateway pairing event:', msg.event, JSON.stringify(msg.payload || {}));
         }
       } catch { /* binary */ }
       if (browserWs.readyState === WebSocket.OPEN) browserWs.send(data);
