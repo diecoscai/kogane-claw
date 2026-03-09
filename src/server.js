@@ -23,7 +23,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { spawn, execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
-import { randomBytes, createHash, timingSafeEqual } from 'crypto';
+import { randomBytes, createHash, timingSafeEqual, webcrypto } from 'crypto';
 import { homedir } from 'os';
 import { pipeline } from 'stream/promises';
 import * as tar from 'tar';
@@ -56,6 +56,34 @@ const PAIRING_CODE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 const loginAttempts = new Map(); // IP -> { count, lastAttempt, lockedUntil }
 const sessions = new Map(); // sessionId -> { ip, createdAt, csrfToken }
 const pendingPairings = new Map(); // code -> { deviceName, ip, createdAt, approved }
+
+// ============================================================================
+// SERVER DEVICE (for WS proxy server-side signing)
+// ============================================================================
+
+let serverDevice = null;
+
+async function initServerDevice() {
+  const subtle = webcrypto.subtle;
+  const keyPair = await subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+  const pubRaw = await subtle.exportKey('raw', keyPair.publicKey);
+  const pubB64 = Buffer.from(pubRaw).toString('base64url');
+  const hashBuf = await subtle.digest('SHA-256', pubRaw);
+  const deviceId = Buffer.from(hashBuf).toString('hex');
+  serverDevice = { deviceId, publicKey: pubB64, signKey: keyPair.privateKey };
+  console.log('[ws-proxy] server device initialized, id:', deviceId.slice(0, 16) + '...');
+}
+
+async function signChallenge(nonce) {
+  const subtle = webcrypto.subtle;
+  const data = new TextEncoder().encode(nonce);
+  const sig = await subtle.sign({ name: 'ECDSA', hash: { name: 'SHA-256' } }, serverDevice.signKey, data);
+  return Buffer.from(sig).toString('base64url');
+}
 
 // ============================================================================
 // INITIALIZATION
@@ -1480,48 +1508,48 @@ server.on('upgrade', (req, socket, head) => {
       pendingFromBrowser.length = 0;
     });
 
-    browserWs.on('message', (data) => {
-      let outgoing = data;
+    browserWs.on('message', async (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        if (msg.type === 'req' && msg.method === 'connect') {
-          if (!msg.params) msg.params = {};
-          if (!msg.params.auth) msg.params.auth = {};
-          msg.params.auth.token = gatewayToken;
-          const deviceNonce = msg.params?.device?.nonce;
-          if (!deviceNonce && !challengeNonce) {
+        if (msg.type === 'req' && msg.method === 'connect' && serverDevice) {
+          if (!challengeNonce) {
             pendingConnectFrame = msg;
-            console.log('[ws-proxy] held connect frame, waiting for challenge nonce');
+            console.log('[ws-proxy] held connect frame, waiting for challenge');
             return;
           }
-          if (!deviceNonce && challengeNonce && msg.params.device) {
-            msg.params.device.nonce = challengeNonce;
-            challengeNonce = null;
-          }
-          outgoing = JSON.stringify(msg);
-          console.log('[ws-proxy] forwarded connect frame with token+nonce');
+          const nonce = challengeNonce;
+          challengeNonce = null;
+          const signature = await signChallenge(nonce);
+          msg.params = msg.params || {};
+          msg.params.auth = { token: gatewayToken };
+          msg.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature };
+          if (upstreamOpen) gatewayWs.send(JSON.stringify(msg));
+          else pendingFromBrowser.push(JSON.stringify(msg));
+          console.log('[ws-proxy] forwarded server-signed connect');
+          return;
         }
       } catch { /* binary or non-connect, forward as-is */ }
-      if (upstreamOpen) {
-        gatewayWs.send(outgoing);
-      } else {
-        pendingFromBrowser.push(outgoing);
-      }
+      if (upstreamOpen) gatewayWs.send(data);
+      else pendingFromBrowser.push(data);
     });
 
-    gatewayWs.on('message', (data) => {
+    gatewayWs.on('message', async (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === 'event' && msg.event === 'connect.challenge' && msg.payload?.nonce) {
           challengeNonce = msg.payload.nonce;
-          console.log('[ws-proxy] received challenge nonce:', challengeNonce.slice(0, 8) + '...');
+          console.log('[ws-proxy] challenge:', challengeNonce.slice(0, 8) + '...');
           if (pendingConnectFrame) {
             const frame = pendingConnectFrame;
             pendingConnectFrame = null;
-            if (frame.params.device) frame.params.device.nonce = challengeNonce;
+            const nonce = challengeNonce;
             challengeNonce = null;
-            console.log('[ws-proxy] released held connect frame with challenge nonce');
-            gatewayWs.send(JSON.stringify(frame));
+            const signature = await signChallenge(nonce);
+            frame.params = frame.params || {};
+            frame.params.auth = { token: gatewayToken };
+            frame.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature };
+            console.log('[ws-proxy] released held connect with server signature');
+            if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.send(JSON.stringify(frame));
           }
         }
       } catch { /* binary */ }
@@ -2587,6 +2615,8 @@ function getSetupHTML(csrfToken, sessionId) {
 // ============================================================================
 // START SERVER
 // ============================================================================
+
+initServerDevice().catch(err => console.error('[ws-proxy] Failed to init server device:', err));
 
 server.listen(PUBLIC_PORT, '0.0.0.0', () => {
   console.log('[wrapper] OpenClaw Railway wrapper listening on port ' + PUBLIC_PORT);
