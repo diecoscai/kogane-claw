@@ -1415,15 +1415,14 @@ function injectCustomSidebarScript(html) {
   return html.slice(0, idx) + CUSTOM_SIDEBAR_SCRIPT_TAG + html.slice(idx);
 }
 
-const TOKEN_INJECT_SCRIPT_SRC = '/_custom/token-inject.js';
-const TOKEN_INJECT_SCRIPT_TAG = `<script src="${TOKEN_INJECT_SCRIPT_SRC}"></script>`;
-const TOKEN_INJECT_SCRIPT_RE = /<script\b[^>]*\bsrc=["']\/_custom\/token-inject\.js["'][^>]*>/i;
+const TOKEN_INJECT_MARKER = '__KOGANE_TOKEN_INJECTED__';
 
-function injectGatewayToken(html) {
-  if (TOKEN_INJECT_SCRIPT_RE.test(html)) return html;
+function injectGatewayToken(html, token) {
+  if (html.includes(TOKEN_INJECT_MARKER)) return html;
   const headClose = html.toLowerCase().indexOf('</head>');
   if (headClose === -1) return html;
-  return html.slice(0, headClose) + TOKEN_INJECT_SCRIPT_TAG + html.slice(headClose);
+  const script = `<script data-kogane="${TOKEN_INJECT_MARKER}">(function(){var h=window.location.hash||'';if(!h.includes('token=')){window.location.replace(window.location.pathname+window.location.search+'#'+(h.length>1?h.slice(1)+'&':'')+'token=${token}');}})();</script>`;
+  return html.slice(0, headClose) + script + html.slice(headClose);
 }
 
 const proxy = httpProxy.createProxyServer({
@@ -1485,7 +1484,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     const html = decodedBody.toString('utf-8');
     let injected = injectCustomSidebarScript(html);
     if (gatewayToken) {
-      injected = injectGatewayToken(injected);
+      injected = injectGatewayToken(injected, gatewayToken);
     }
 
     if (injected === html) {
