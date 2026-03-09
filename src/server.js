@@ -1522,7 +1522,8 @@ server.on('upgrade', (req, socket, head) => {
           const signature = await signChallenge(nonce);
           msg.params = msg.params || {};
           msg.params.auth = { token: gatewayToken };
-          msg.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature };
+          const signedAt = Date.now();
+          msg.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature, signedAt };
           if (upstreamOpen) gatewayWs.send(JSON.stringify(msg));
           else pendingFromBrowser.push(JSON.stringify(msg));
           console.log('[ws-proxy] forwarded server-signed connect');
@@ -1547,7 +1548,8 @@ server.on('upgrade', (req, socket, head) => {
             const signature = await signChallenge(nonce);
             frame.params = frame.params || {};
             frame.params.auth = { token: gatewayToken };
-            frame.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature };
+            const signedAt = Date.now();
+            frame.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature, signedAt };
             console.log('[ws-proxy] released held connect with server signature');
             if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.send(JSON.stringify(frame));
           }
