@@ -65,11 +65,7 @@ let serverDevice = null;
 
 async function initServerDevice() {
   const subtle = webcrypto.subtle;
-  const keyPair = await subtle.generateKey(
-    { name: 'ECDSA', namedCurve: 'P-256' },
-    true,
-    ['sign', 'verify']
-  );
+  const keyPair = await subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
   const pubRaw = await subtle.exportKey('raw', keyPair.publicKey);
   const pubB64 = Buffer.from(pubRaw).toString('base64url');
   const hashBuf = await subtle.digest('SHA-256', pubRaw);
@@ -78,10 +74,10 @@ async function initServerDevice() {
   console.log('[ws-proxy] server device initialized, id:', deviceId.slice(0, 16) + '...');
 }
 
-async function signChallenge(nonce) {
+async function signChallenge(nonce, signedAt) {
   const subtle = webcrypto.subtle;
-  const data = new TextEncoder().encode(nonce);
-  const sig = await subtle.sign({ name: 'ECDSA', hash: { name: 'SHA-256' } }, serverDevice.signKey, data);
+  const msg = signedAt !== undefined ? `${nonce}:${signedAt}` : nonce;
+  const sig = await subtle.sign('Ed25519', serverDevice.signKey, new TextEncoder().encode(msg));
   return Buffer.from(sig).toString('base64url');
 }
 
