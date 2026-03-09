@@ -19,6 +19,7 @@
 import express from 'express';
 import http from 'http';
 import httpProxy from 'http-proxy';
+import { WebSocketServer, WebSocket } from 'ws';
 import { spawn, execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
@@ -26,6 +27,7 @@ import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { homedir } from 'os';
 import { pipeline } from 'stream/promises';
 import * as tar from 'tar';
+import zlib from 'zlib';
 
 // ============================================================================
 // CONFIGURATION
@@ -141,9 +143,9 @@ async function startGateway() {
     'run',
     '--bind', 'loopback',
     '--port', String(GATEWAY_PORT),
+    '--allow-unconfigured',
     '--auth', 'token',
     '--token', gatewayToken,
-    '--allow-unconfigured'
   ];
 
   gatewayProcess = spawn('openclaw', gatewayArgs, {
@@ -368,6 +370,107 @@ function validateCSRF(req, res, next) {
 // ============================================================================
 // ROUTES
 // ============================================================================
+
+app.get('/_custom/sidebar-link.js', (req, res) => {
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.send(`(() => {
+  if (window.__openclawCustomCommandCenterInit) return;
+  window.__openclawCustomCommandCenterInit = true;
+
+  const MARKER = 'command-center';
+  const TARGET_HREF = 'https://command-center.diego-costa.up.railway.app';
+  const DOCS_HREF = 'https://docs.openclaw.ai';
+
+  function updateLabel(root) {
+    const leafNodes = Array.from(root.querySelectorAll('*')).filter((el) => el.children.length === 0);
+    for (const el of leafNodes) {
+      const text = (el.textContent || '').trim();
+      if (!text) continue;
+      if (/\bdocs\b/i.test(text)) {
+        el.textContent = text.replace(/\bdocs\b/i, 'Command Center');
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function addLink() {
+    if (document.querySelector('a[data-openclaw-custom="' + MARKER + '"]')) return true;
+
+    const docsLink = document.querySelector('a[href="' + DOCS_HREF + '"]');
+    if (!docsLink) return false;
+
+    const container = docsLink.closest('li') || docsLink.closest('[role="listitem"]') || docsLink.parentElement;
+    if (!container || !container.parentNode) return false;
+
+    const clone = container.cloneNode(true);
+    const link = clone.querySelector('a[href="' + DOCS_HREF + '"]') || clone.querySelector('a') || clone;
+    if (!link || String(link.tagName || '').toLowerCase() !== 'a') return false;
+
+    link.setAttribute('data-openclaw-custom', MARKER);
+    link.setAttribute('href', TARGET_HREF);
+    link.setAttribute('target', '_blank');
+    link.setAttribute('rel', 'noopener noreferrer');
+    link.removeAttribute('aria-current');
+
+    if (!updateLabel(link)) {
+      link.textContent = 'Command Center';
+    }
+
+    container.parentNode.insertBefore(clone, container.nextSibling);
+    return true;
+  }
+
+  let timer = null;
+  function scheduleAddLink() {
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      addLink();
+    }, 50);
+  }
+
+  function startObserver() {
+    try {
+      const observer = new MutationObserver(() => scheduleAddLink());
+      if (document.documentElement) {
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function start() {
+    addLink();
+    startObserver();
+
+    try {
+      const pushState = history.pushState;
+      history.pushState = function () {
+        const ret = pushState.apply(this, arguments);
+        scheduleAddLink();
+        return ret;
+      };
+      const replaceState = history.replaceState;
+      history.replaceState = function () {
+        const ret = replaceState.apply(this, arguments);
+        scheduleAddLink();
+        return ret;
+      };
+      window.addEventListener('popstate', scheduleAddLink);
+    } catch {
+      // ignore
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
+})();`);
+});
 
 // Health check (no auth required)
 app.get('/setup/healthz', (req, res) => {
@@ -1108,6 +1211,39 @@ app.post('/setup/pairing/approve-channel', requireAuth, validateCSRF, (req, res)
   }
 });
 
+// Approve dashboard device pairing (Control UI browser)
+app.post('/setup/devices/approve-dashboard', requireAuth, validateCSRF, (req, res) => {
+  if (!gatewayReady) {
+    return res.status(503).json({ error: 'Gateway not running', message: 'Start the gateway first.' });
+  }
+  try {
+    const approveEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      OPENCLAW_NON_INTERACTIVE: '1'
+    };
+    const result = execFileSync('openclaw', [
+      'devices', 'approve', '--latest',
+      '--url', `ws://127.0.0.1:${GATEWAY_PORT}`,
+      '--token', gatewayToken,
+      '--json'
+    ], { env: approveEnv, encoding: 'utf-8', timeout: 15000 });
+    addLog('Dashboard device approved');
+    res.json({ success: true, message: 'Dashboard device approved. Reload the dashboard to connect.', result: result.trim() });
+  } catch (err) {
+    const msg = (err.stderr || err.stdout || err.message || '').trim();
+    addLog(`Dashboard device approve failed: ${msg}`);
+    const noPending = msg.includes('no pending') || msg.includes('not found') || msg.includes('nothing to approve');
+    res.status(noPending ? 404 : 500).json({
+      error: noPending ? 'No pending request' : 'Approve failed',
+      message: noPending
+        ? 'No pending dashboard pairing request found. Open the dashboard first, then approve.'
+        : `Could not approve: ${msg}`
+    });
+  }
+});
+
 // Logs endpoint
 app.get('/setup/logs', requireAuth, (req, res) => {
   const tail = Math.min(parseInt(req.query.tail || '100', 10), 500);
@@ -1166,6 +1302,33 @@ app.post('/setup/logout', requireAuth, (req, res) => {
 // PROXY TO GATEWAY
 // ============================================================================
 
+const CUSTOM_SIDEBAR_SCRIPT_SRC = '/_custom/sidebar-link.js';
+const CUSTOM_SIDEBAR_SCRIPT_TAG = `<script src="${CUSTOM_SIDEBAR_SCRIPT_SRC}" defer></script>`;
+const CUSTOM_SIDEBAR_SCRIPT_RE = /<script\b[^>]*\bsrc=["']\/_custom\/sidebar-link\.js["'][^>]*>/i;
+
+function decodeProxyBody(buffer, encoding) {
+  if (!encoding || encoding === 'identity') return buffer;
+  if (encoding === 'gzip') return zlib.gunzipSync(buffer);
+  if (encoding === 'br') return zlib.brotliDecompressSync(buffer);
+  if (encoding === 'deflate') return zlib.inflateSync(buffer);
+  return buffer;
+}
+
+function encodeProxyBody(buffer, encoding) {
+  if (!encoding || encoding === 'identity') return buffer;
+  if (encoding === 'gzip') return zlib.gzipSync(buffer);
+  if (encoding === 'br') return zlib.brotliCompressSync(buffer);
+  if (encoding === 'deflate') return zlib.deflateSync(buffer);
+  return buffer;
+}
+
+function injectCustomSidebarScript(html) {
+  if (CUSTOM_SIDEBAR_SCRIPT_RE.test(html)) return html;
+  const idx = html.toLowerCase().lastIndexOf('</body>');
+  if (idx === -1) return html;
+  return html.slice(0, idx) + CUSTOM_SIDEBAR_SCRIPT_TAG + html.slice(idx);
+}
+
 const proxy = httpProxy.createProxyServer({
   target: `http://${GATEWAY_HOST}:${GATEWAY_PORT}`,
   ws: true,
@@ -1182,8 +1345,76 @@ proxy.on('error', (err, req, res) => {
   }
 });
 
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  const headers = { ...proxyRes.headers };
+  const statusCode = proxyRes.statusCode ?? 502;
+  const method = String(req.method || 'GET').toUpperCase();
+  const contentType = String(headers['content-type'] || '');
+  const encoding = String(headers['content-encoding'] || '').toLowerCase();
+
+  const isHtml = /\btext\/html\b/i.test(contentType);
+  const isNoBody = method === 'HEAD' || statusCode === 204 || statusCode === 304;
+
+  if (!isHtml || isNoBody) {
+    res.writeHead(statusCode, headers);
+    if (isNoBody) {
+      res.end();
+      return;
+    }
+    proxyRes.pipe(res);
+    return;
+  }
+
+  const chunks = [];
+  proxyRes.on('data', (chunk) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+
+  proxyRes.on('end', () => {
+    const rawBody = Buffer.concat(chunks);
+
+    let decodedBody;
+    try {
+      decodedBody = decodeProxyBody(rawBody, encoding);
+    } catch {
+      res.writeHead(statusCode, headers);
+      res.end(rawBody);
+      return;
+    }
+
+    const html = decodedBody.toString('utf-8');
+    const injected = injectCustomSidebarScript(html);
+
+    if (injected === html) {
+      res.writeHead(statusCode, headers);
+      res.end(rawBody);
+      return;
+    }
+
+    delete headers['content-length'];
+    delete headers['etag'];
+    delete headers['content-md5'];
+    delete headers['transfer-encoding'];
+
+    const injectedDecoded = Buffer.from(injected, 'utf-8');
+
+    let outBody;
+    try {
+      outBody = encodeProxyBody(injectedDecoded, encoding);
+    } catch {
+      delete headers['content-encoding'];
+      outBody = injectedDecoded;
+    }
+
+    headers['content-length'] = String(outBody.length);
+    res.writeHead(statusCode, headers);
+    res.end(outBody);
+  });
+});
+
 app.use((req, res, next) => {
   if (req.path.startsWith('/setup')) return next();
+  if (req.path.startsWith('/_custom/')) return next();
 
   if (!gatewayReady) {
     return res.status(503).json({
@@ -1202,7 +1433,7 @@ app.use((req, res, next) => {
     req.url = targetPath + query;
   }
 
-  proxy.web(req, res);
+  proxy.web(req, res, { selfHandleResponse: true });
 });
 
 // ============================================================================
@@ -1211,21 +1442,110 @@ app.use((req, res, next) => {
 
 const server = http.createServer(app);
 
+const wss = new WebSocketServer({ noServer: true });
+
 server.on('upgrade', (req, socket, head) => {
   if (!gatewayReady) {
     socket.destroy();
     return;
   }
-  req.headers['x-gateway-token'] = gatewayToken;
-  // Same path rewrite for WebSocket (dashboard live updates)
-  if (req.url && (req.url.startsWith('/openclaw') || req.url.startsWith('/openclaw/'))) {
-    const queryStart = req.url.indexOf('?');
-    const pathOnly = queryStart >= 0 ? req.url.slice(0, queryStart) : req.url;
-    const query = queryStart >= 0 ? req.url.slice(queryStart) : '';
-    const targetPath = pathOnly === '/openclaw' || pathOnly === '/openclaw/' ? '/' : pathOnly.slice('/openclaw'.length) || '/';
-    req.url = targetPath + query;
+
+  let targetUrl = req.url || '/';
+  if (targetUrl.startsWith('/openclaw')) {
+    const queryStart = targetUrl.indexOf('?');
+    const pathOnly = queryStart >= 0 ? targetUrl.slice(0, queryStart) : targetUrl;
+    const query = queryStart >= 0 ? targetUrl.slice(queryStart) : '';
+    const rewritten = pathOnly === '/openclaw' || pathOnly === '/openclaw/' ? '/' : pathOnly.slice('/openclaw'.length) || '/';
+    targetUrl = rewritten + query;
   }
-  proxy.ws(req, socket, head);
+
+  wss.handleUpgrade(req, socket, head, (browserWs) => {
+    const gatewayWs = new WebSocket(`ws://${GATEWAY_HOST}:${GATEWAY_PORT}${targetUrl}`, {
+      headers: {
+        'x-forwarded-for': req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+        'x-forwarded-host': req.headers['host'],
+        'origin': req.headers['origin'] || `https://${req.headers['host']}`,
+        'user-agent': req.headers['user-agent'] || '',
+      }
+    });
+
+    let upstreamOpen = false;
+    const pendingFromBrowser = [];
+    let pendingConnectFrame = null;
+    let challengeNonce = null;
+
+    gatewayWs.on('open', () => {
+      upstreamOpen = true;
+      for (const msg of pendingFromBrowser) gatewayWs.send(msg);
+      pendingFromBrowser.length = 0;
+    });
+
+    browserWs.on('message', (data) => {
+      let outgoing = data;
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'req' && msg.method === 'connect') {
+          if (!msg.params) msg.params = {};
+          if (!msg.params.auth) msg.params.auth = {};
+          msg.params.auth.token = gatewayToken;
+          const deviceNonce = msg.params?.device?.nonce;
+          if (!deviceNonce && !challengeNonce) {
+            pendingConnectFrame = msg;
+            console.log('[ws-proxy] held connect frame, waiting for challenge nonce');
+            return;
+          }
+          if (!deviceNonce && challengeNonce && msg.params.device) {
+            msg.params.device.nonce = challengeNonce;
+            challengeNonce = null;
+          }
+          outgoing = JSON.stringify(msg);
+          console.log('[ws-proxy] forwarded connect frame with token+nonce');
+        }
+      } catch { /* binary or non-connect, forward as-is */ }
+      if (upstreamOpen) {
+        gatewayWs.send(outgoing);
+      } else {
+        pendingFromBrowser.push(outgoing);
+      }
+    });
+
+    gatewayWs.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === 'event' && msg.event === 'connect.challenge' && msg.payload?.nonce) {
+          challengeNonce = msg.payload.nonce;
+          console.log('[ws-proxy] received challenge nonce:', challengeNonce.slice(0, 8) + '...');
+          if (pendingConnectFrame) {
+            const frame = pendingConnectFrame;
+            pendingConnectFrame = null;
+            if (frame.params.device) frame.params.device.nonce = challengeNonce;
+            challengeNonce = null;
+            console.log('[ws-proxy] released held connect frame with challenge nonce');
+            gatewayWs.send(JSON.stringify(frame));
+          }
+        }
+      } catch { /* binary */ }
+      if (browserWs.readyState === WebSocket.OPEN) browserWs.send(data);
+    });
+
+    gatewayWs.on('close', (code, reason) => {
+      if (browserWs.readyState === WebSocket.OPEN) browserWs.close(code, reason);
+    });
+
+    gatewayWs.on('error', (err) => {
+      console.error('[ws-proxy] upstream error:', err.message);
+      browserWs.close(1011, 'Gateway error');
+    });
+
+    browserWs.on('close', (code, reason) => {
+      if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.close(code, reason);
+    });
+
+    browserWs.on('error', (err) => {
+      console.error('[ws-proxy] browser error:', err.message);
+      gatewayWs.close(1011, 'Browser error');
+    });
+  });
 });
 
 // ============================================================================
@@ -1666,6 +1986,31 @@ function getSetupHTML(csrfToken, sessionId) {
         </div>
       </div>
 
+      <!-- Connect Dashboard Device -->
+      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center gap-3 mb-6">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500/20 to-purple-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="text-lg font-semibold text-white">Connect Dashboard</h2>
+            <p class="text-sm text-slate-400">Approve this browser to access the Control UI dashboard. Open the dashboard first, then click Approve.</p>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <p class="text-xs text-slate-500">Steps: 1) Open the <a href="/openclaw" target="_blank" class="text-violet-400 underline">dashboard</a> in a new tab &nbsp;2) Come back here &nbsp;3) Click Approve below</p>
+          <button type="button" onclick="approveDashboardDevice()" id="approveDashboardBtn" class="w-full py-3 rounded-xl bg-violet-500/10 border border-violet-500/20 text-violet-400 font-medium transition-all duration-200 hover:bg-violet-500/20 hover:border-violet-500/40">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+              Approve Dashboard Device
+            </span>
+          </button>
+          <div id="dashboardApproveMsg" class="hidden p-3 rounded-lg text-sm"></div>
+        </div>
+      </div>
+
       <!-- Approve channel pairing (Telegram/Discord/Slack: user DMs bot, gets code, owner approves here) -->
       <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
         <div class="flex items-center gap-3 mb-6">
@@ -2088,6 +2433,29 @@ function getSetupHTML(csrfToken, sessionId) {
         statusDiv.classList.remove('hidden');
       } else {
         statusDiv.classList.add('hidden');
+      }
+    }
+
+    async function approveDashboardDevice() {
+      const btn = document.getElementById('approveDashboardBtn');
+      const msg = document.getElementById('dashboardApproveMsg');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Approving...</span>';
+      msg.className = 'hidden';
+      try {
+        const res = await secureFetch('/setup/devices/approve-dashboard', { method: 'POST', body: JSON.stringify({}) });
+        const data = await res.json();
+        msg.className = data.success
+          ? 'p-3 rounded-lg text-sm bg-green-500/10 border border-green-500/20 text-green-400'
+          : 'p-3 rounded-lg text-sm bg-red-500/10 border border-red-500/20 text-red-400';
+        msg.textContent = data.message || data.error || (data.success ? 'Approved!' : 'Failed');
+        if (data.success) setTimeout(() => { msg.className = 'hidden'; }, 5000);
+      } catch (e) {
+        msg.className = 'p-3 rounded-lg text-sm bg-red-500/10 border border-red-500/20 text-red-400';
+        msg.textContent = 'Request failed. Please try again.';
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>Approve Dashboard Device</span>';
       }
     }
 

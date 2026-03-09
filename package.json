@@ -16,7 +16,8 @@
   "dependencies": {
     "express": "^5.1.0",
     "http-proxy": "^1.18.1",
-    "tar": "^7.5.4"
+    "tar": "^7.5.4",
+    "ws": "^8.19.0"
   },
   "repository": {
     "type": "git",

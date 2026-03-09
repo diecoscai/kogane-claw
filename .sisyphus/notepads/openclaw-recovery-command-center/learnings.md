@@ -1,0 +1,2 @@
+- Added wrapper-served `/_custom/sidebar-link.js` and injected `<script src="/_custom/sidebar-link.js" defer></script>` into proxied HTML responses only.
+- Sidebar link insertion clones the existing docs link (`a[href="https://docs.openclaw.ai"]`) and uses `data-openclaw-custom="command-center"` for idempotency.
