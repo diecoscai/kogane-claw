@@ -432,6 +432,19 @@ function validateCSRF(req, res, next) {
 // ROUTES
 // ============================================================================
 
+app.get('/_custom/token-inject.js', (req, res) => {
+  const token = gatewayToken;
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`(function(){
+  var h=window.location.hash||'';
+  if(h.includes('token='))return;
+  var sep=h.length>1?'&':'#';
+  window.history.replaceState(null,'',window.location.pathname+window.location.search+h+sep+'token=${token}');
+  window.dispatchEvent(new HashChangeEvent('hashchange'));
+})();`);
+});
+
 app.get('/_custom/sidebar-link.js', (req, res) => {
   res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
   res.send(`(() => {
@@ -1390,21 +1403,15 @@ function injectCustomSidebarScript(html) {
   return html.slice(0, idx) + CUSTOM_SIDEBAR_SCRIPT_TAG + html.slice(idx);
 }
 
-function injectGatewayToken(html, token) {
-  const marker = '<!-- __KOGANE_TOKEN_INJECTED__ -->';
-  if (html.includes(marker)) return html;
-  const script = `${marker}<script>
-(function(){
-  var h=window.location.hash;
-  if(!h||!h.includes('token=')){
-    var newHash=(h?h+'&':'#')+'token=${token}';
-    window.history.replaceState(null,'',window.location.pathname+window.location.search+newHash);
-  }
-})();
-</script>`;
+const TOKEN_INJECT_SCRIPT_SRC = '/_custom/token-inject.js';
+const TOKEN_INJECT_SCRIPT_TAG = `<script src="${TOKEN_INJECT_SCRIPT_SRC}"></script>`;
+const TOKEN_INJECT_SCRIPT_RE = /<script\b[^>]*\bsrc=["']\/_custom\/token-inject\.js["'][^>]*>/i;
+
+function injectGatewayToken(html) {
+  if (TOKEN_INJECT_SCRIPT_RE.test(html)) return html;
   const headClose = html.toLowerCase().indexOf('</head>');
   if (headClose === -1) return html;
-  return html.slice(0, headClose) + script + html.slice(headClose);
+  return html.slice(0, headClose) + TOKEN_INJECT_SCRIPT_TAG + html.slice(headClose);
 }
 
 const proxy = httpProxy.createProxyServer({
@@ -1463,7 +1470,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     const html = decodedBody.toString('utf-8');
     let injected = injectCustomSidebarScript(html);
     if (gatewayToken) {
-      injected = injectGatewayToken(injected, gatewayToken);
+      injected = injectGatewayToken(injected);
     }
 
     if (injected === html) {
