@@ -898,7 +898,7 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
             openclawConfig.agents.defaults.models[primaryModel] = {};
           }
         }
-        writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
+        writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o644 });
       }
     } catch (e) {
       // ignore
@@ -2823,7 +2823,7 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
           if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
           openclawConfig.gateway.controlUi.allowInsecureAuth = true;
           delete openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth;
-          writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
+          writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o644 });
           console.log('[wrapper] Set gateway.mode, trustedProxies, controlUi.allowInsecureAuth for proxy/dashboard');
         }
       }
