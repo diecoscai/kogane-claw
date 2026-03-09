@@ -62,16 +62,34 @@ const pendingPairings = new Map(); // code -> { deviceName, ip, createdAt, appro
 // ============================================================================
 
 let serverDevice = null;
+const DEVICE_KEY_FILE = join(STATE_DIR, 'proxy-device.json');
 
 async function initServerDevice() {
   const subtle = webcrypto.subtle;
+
+  if (existsSync(DEVICE_KEY_FILE)) {
+    try {
+      const saved = JSON.parse(readFileSync(DEVICE_KEY_FILE, 'utf-8'));
+      const privJwk = saved.privateKeyJwk;
+      const signKey = await subtle.importKey('jwk', privJwk, { name: 'Ed25519' }, false, ['sign']);
+      serverDevice = { deviceId: saved.deviceId, publicKey: saved.publicKey, signKey };
+      console.log('[ws-proxy] server device loaded from disk, id:', saved.deviceId.slice(0, 16) + '...');
+      return;
+    } catch (e) {
+      console.warn('[ws-proxy] failed to load saved device key, generating new one:', e.message);
+    }
+  }
+
   const keyPair = await subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
   const pubRaw = await subtle.exportKey('raw', keyPair.publicKey);
   const pubB64 = Buffer.from(pubRaw).toString('base64url');
   const hashBuf = await subtle.digest('SHA-256', pubRaw);
   const deviceId = Buffer.from(hashBuf).toString('hex');
+  const privateKeyJwk = await subtle.exportKey('jwk', keyPair.privateKey);
+
+  writeFileSync(DEVICE_KEY_FILE, JSON.stringify({ deviceId, publicKey: pubB64, privateKeyJwk }), { mode: 0o600 });
   serverDevice = { deviceId, publicKey: pubB64, signKey: keyPair.privateKey };
-  console.log('[ws-proxy] server device initialized, id:', deviceId.slice(0, 16) + '...');
+  console.log('[ws-proxy] server device generated and saved, id:', deviceId.slice(0, 16) + '...');
 }
 
 const DEFAULT_SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.pairing'];
@@ -753,9 +771,9 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
         openclawConfig.gateway.auth.token = gatewayToken;
         // Trust our wrapper proxy so gateway accepts X-Forwarded-* and treats clients correctly (any public URL)
         openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
-        // When behind reverse proxy (e.g. Railway): use token-only auth so dashboard works without device pairing
         if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
         openclawConfig.gateway.controlUi.allowInsecureAuth = true;
+        openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
         // Set default model to the provider the user configured (avoids "No API key for anthropic")
         const primaryModel = config.primaryModel;
         if (primaryModel) {
@@ -1372,6 +1390,23 @@ function injectCustomSidebarScript(html) {
   return html.slice(0, idx) + CUSTOM_SIDEBAR_SCRIPT_TAG + html.slice(idx);
 }
 
+function injectGatewayToken(html, token) {
+  const marker = '<!-- __KOGANE_TOKEN_INJECTED__ -->';
+  if (html.includes(marker)) return html;
+  const script = `${marker}<script>
+(function(){
+  var h=window.location.hash;
+  if(!h||!h.includes('token=')){
+    var newHash=(h?h+'&':'#')+'token=${token}';
+    window.history.replaceState(null,'',window.location.pathname+window.location.search+newHash);
+  }
+})();
+</script>`;
+  const headClose = html.toLowerCase().indexOf('</head>');
+  if (headClose === -1) return html;
+  return html.slice(0, headClose) + script + html.slice(headClose);
+}
+
 const proxy = httpProxy.createProxyServer({
   target: `http://${GATEWAY_HOST}:${GATEWAY_PORT}`,
   ws: true,
@@ -1426,7 +1461,10 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     }
 
     const html = decodedBody.toString('utf-8');
-    const injected = injectCustomSidebarScript(html);
+    let injected = injectCustomSidebarScript(html);
+    if (gatewayToken) {
+      injected = injectGatewayToken(injected, gatewayToken);
+    }
 
     if (injected === html) {
       res.writeHead(statusCode, headers);
@@ -2672,8 +2710,9 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
           if (!openclawConfig.gateway.trustedProxies?.length) openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
           if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
           openclawConfig.gateway.controlUi.allowInsecureAuth = true;
+          openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
           writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
-          console.log('[wrapper] Set gateway.mode, trustedProxies, and controlUi.allowInsecureAuth for proxy/dashboard');
+          console.log('[wrapper] Set gateway.mode, trustedProxies, controlUi.allowInsecureAuth, dangerouslyDisableDeviceAuth for proxy/dashboard');
         }
       }
     } catch (e) {}
