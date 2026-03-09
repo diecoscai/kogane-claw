@@ -1508,6 +1508,8 @@ server.on('upgrade', (req, socket, head) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === 'req' && msg.method === 'connect' && serverDevice) {
+          const dev = msg.params?.device || {};
+          console.log('[ws-proxy] browser connect device fields:', Object.keys(dev).join(','), 'pubkey-len:', dev.publicKey ? Buffer.from(dev.publicKey, 'base64url').length : 0, 'sig-len:', dev.signature ? Buffer.from(dev.signature, 'base64url').length : 0, 'nonce:', dev.nonce ? dev.nonce.slice(0, 8) : '(empty)', 'signedAt:', dev.signedAt);
           if (!challengeNonce) {
             pendingConnectFrame = msg;
             console.log('[ws-proxy] held connect frame, waiting for challenge');
@@ -1515,10 +1517,10 @@ server.on('upgrade', (req, socket, head) => {
           }
           const nonce = challengeNonce;
           challengeNonce = null;
-          const signature = await signChallenge(nonce);
+          const signedAt = Date.now();
+          const signature = await signChallenge(nonce, signedAt);
           msg.params = msg.params || {};
           msg.params.auth = { token: gatewayToken };
-          const signedAt = Date.now();
           msg.params.device = { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature, signedAt };
           if (upstreamOpen) gatewayWs.send(JSON.stringify(msg));
           else pendingFromBrowser.push(JSON.stringify(msg));
