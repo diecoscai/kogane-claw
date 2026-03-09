@@ -112,7 +112,14 @@ function startOperatorWs() {
       }
 
       if (msg.ok && msg.payload?.type === 'hello-ok') {
-        console.log('[operator-ws] hello-ok, auth present:', !!msg.payload.auth?.deviceToken);
+        const auth = msg.payload.auth;
+        const scopes = auth?.scopes || [];
+        const scopesOk = scopes.includes('operator.read') && scopes.includes('operator.write');
+        console.log('[operator-ws] hello-ok, deviceToken present:', !!auth?.deviceToken, 'scopes ok:', scopesOk, scopes.join(','));
+        if (auth?.deviceToken && !scopesOk) {
+          console.log('[operator-ws] scopes missing read/write — removing device to trigger re-pair with full scopes');
+          ws.send(JSON.stringify({ type: 'req', id: `op-${++operatorReqId}`, method: 'device.pair.remove', params: { deviceId: serverDevice.deviceId } }));
+        }
         return;
       }
 
@@ -1669,12 +1676,12 @@ server.on('upgrade', (req, socket, head) => {
       const signOpts = {
         clientId: client.id || 'web',
         clientMode: client.mode || 'web',
-        role: p.role || 'operator',
-        scopes: p.scopes || DEFAULT_SCOPES,
+        role: 'operator',
+        scopes: DEFAULT_SCOPES,
       };
       const signature = await signChallenge(nonce, ts, gatewayToken, signOpts);
-      frame.params = { ...p, auth: { token: gatewayToken }, device: { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature, signedAt: ts } };
-      console.log('[ws-proxy] connect params - clientId:', signOpts.clientId, 'clientMode:', signOpts.clientMode, 'role:', signOpts.role);
+      frame.params = { ...p, role: 'operator', scopes: DEFAULT_SCOPES, auth: { token: gatewayToken }, device: { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature, signedAt: ts } };
+      console.log('[ws-proxy] connect params - clientId:', signOpts.clientId, 'clientMode:', signOpts.clientMode, 'scopes:', DEFAULT_SCOPES.join(','));
       return frame;
     };
 
