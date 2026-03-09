@@ -64,6 +64,85 @@ const pendingPairings = new Map(); // code -> { deviceName, ip, createdAt, appro
 let serverDevice = null;
 const DEVICE_KEY_FILE = join(STATE_DIR, 'proxy-device.json');
 
+// ============================================================================
+// OPERATOR WS
+// ============================================================================
+
+let operatorWs = null;
+let operatorReqId = 0;
+
+function startOperatorWs() {
+  if (operatorWs && (operatorWs.readyState === WebSocket.OPEN || operatorWs.readyState === WebSocket.CONNECTING)) return;
+
+  const ws = new WebSocket(`ws://${GATEWAY_HOST}:${GATEWAY_PORT}/`, {
+    headers: {
+      'x-forwarded-for': '127.0.0.1',
+      'x-forwarded-host': 'localhost',
+      'origin': 'https://localhost',
+      'user-agent': 'kogane-proxy-operator/1.0',
+    },
+  });
+  operatorWs = ws;
+
+  ws.on('message', async (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+
+      if (msg.type === 'event' && msg.event === 'connect.challenge' && msg.payload?.nonce) {
+        const { nonce, ts } = msg.payload;
+        const signature = await signChallenge(nonce, ts, gatewayToken, {
+          clientId: 'kogane-proxy',
+          clientMode: 'operator',
+          role: 'operator',
+          scopes: DEFAULT_SCOPES,
+        });
+        ws.send(JSON.stringify({
+          type: 'req',
+          id: `op-${++operatorReqId}`,
+          method: 'connect',
+          params: {
+            auth: { token: gatewayToken },
+            device: { id: serverDevice.deviceId, publicKey: serverDevice.publicKey, nonce, signature, signedAt: ts },
+            client: { id: 'kogane-proxy', mode: 'operator' },
+            role: 'operator',
+            scopes: DEFAULT_SCOPES,
+          },
+        }));
+        return;
+      }
+
+      if (msg.ok && msg.payload?.type === 'hello-ok') {
+        console.log('[operator-ws] hello-ok, auth present:', !!msg.payload.auth?.deviceToken);
+        return;
+      }
+
+      if (msg.type === 'event' && msg.event === 'device.pair.requested') {
+        const { requestId, deviceId } = msg.payload || {};
+        console.log('[operator-ws] auto-approving pair request:', requestId, 'device:', deviceId?.slice(0, 16) + '...');
+        ws.send(JSON.stringify({
+          type: 'req',
+          id: `op-${++operatorReqId}`,
+          method: 'device.pair.approve',
+          params: { requestId },
+        }));
+        return;
+      }
+
+      if (msg.type === 'event' && msg.event === 'device.pair.resolved') {
+        console.log('[operator-ws] pair resolved:', msg.payload?.decision, 'device:', msg.payload?.deviceId?.slice(0, 16) + '...');
+      }
+    } catch (_) {}
+  });
+
+  ws.on('close', (code) => {
+    console.log('[operator-ws] closed, code:', code, '— reconnecting in 5s');
+    operatorWs = null;
+    setTimeout(startOperatorWs, 5000);
+  });
+
+  ws.on('error', (err) => console.error('[operator-ws] error:', err.message));
+}
+
 async function initServerDevice() {
   const subtle = webcrypto.subtle;
 
@@ -246,6 +325,7 @@ async function startGateway() {
   if (ready) {
     gatewayReady = true;
     addLog('Gateway ready');
+    if (serverDevice && gatewayToken) startOperatorWs();
   }
 }
 
@@ -798,7 +878,7 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
         openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
         if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
         openclawConfig.gateway.controlUi.allowInsecureAuth = true;
-        openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
+        delete openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth;
         // Set default model to the provider the user configured (avoids "No API key for anthropic")
         const primaryModel = config.primaryModel;
         if (primaryModel) {
@@ -1421,7 +1501,7 @@ function injectGatewayToken(html, token) {
   if (html.includes(TOKEN_INJECT_MARKER)) return html;
   const headClose = html.toLowerCase().indexOf('</head>');
   if (headClose === -1) return html;
-  const script = `<script data-kogane="${TOKEN_INJECT_MARKER}">(function(){var h=window.location.hash||'';if(!h.includes('token=')){window.location.replace(window.location.pathname+window.location.search+'#'+(h.length>1?h.slice(1)+'&':'')+'token=${token}');}})();</script>`;
+  const script = `<script data-kogane="${TOKEN_INJECT_MARKER}">(function(){try{var t='${token}';var o=window.location.origin;var p='openclaw.control.token.v1:';[o+'/',o].forEach(function(u){try{if(!localStorage.getItem(p+u))localStorage.setItem(p+u,t);}catch(e){}});var h=window.location.hash||'';if(!h.includes('token=')){history.replaceState(null,'',window.location.pathname+window.location.search+'#'+(h.length>1?h.slice(1)+'&':'')+'token='+t);}}catch(e){}})();</script>`;
   return html.slice(0, headClose) + script + html.slice(headClose);
 }
 
@@ -1640,14 +1720,10 @@ server.on('upgrade', (req, socket, head) => {
             console.log('[ws-proxy] released held connect with server signature, ts:', ts);
             if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.send(JSON.stringify(signed));
           }
-        } else if (msg.type === 'event' && (msg.event === 'hello-ok' || msg.event === 'hello.ok' || msg.event === 'connect.ok' || msg.event === 'connect.success')) {
-          console.log('[ws-proxy] gateway hello-ok:', JSON.stringify(msg));
-        } else if (msg.type === 'res' && msg.method === 'connect') {
-          console.log('[ws-proxy] gateway connect response:', JSON.stringify(msg));
-        } else if (msg.type === 'event' && msg.event && msg.event.startsWith('connect')) {
-          console.log('[ws-proxy] gateway connect event:', msg.event, JSON.stringify(msg.payload || {}));
-        } else if (msg.type === 'event' && msg.event && (msg.event.includes('pair') || msg.event.includes('device'))) {
-          console.log('[ws-proxy] gateway pairing event:', msg.event, JSON.stringify(msg.payload || {}));
+        } else if (msg.ok && msg.payload?.type === 'hello-ok') {
+          console.log('[ws-proxy] hello-ok, auth present:', !!msg.payload.auth?.deviceToken, JSON.stringify(msg.payload.auth || null));
+        } else if (msg.type === 'event' && msg.event?.startsWith('connect')) {
+          console.log('[ws-proxy] connect event:', msg.event, JSON.stringify(msg.payload || {}));
         }
       } catch { /* binary */ }
       if (browserWs.readyState === WebSocket.OPEN) browserWs.send(data);
@@ -2739,9 +2815,9 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
           if (!openclawConfig.gateway.trustedProxies?.length) openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
           if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
           openclawConfig.gateway.controlUi.allowInsecureAuth = true;
-          openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
+          delete openclawConfig.gateway.controlUi.dangerouslyDisableDeviceAuth;
           writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
-          console.log('[wrapper] Set gateway.mode, trustedProxies, controlUi.allowInsecureAuth, dangerouslyDisableDeviceAuth for proxy/dashboard');
+          console.log('[wrapper] Set gateway.mode, trustedProxies, controlUi.allowInsecureAuth for proxy/dashboard');
         }
       }
     } catch (e) {}
