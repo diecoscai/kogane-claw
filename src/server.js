@@ -189,6 +189,11 @@ async function startGateway() {
     return;
   }
 
+  try {
+    execFileSync('pkill', ['-SIGTERM', '-f', 'openclaw.*gateway.*run'], { stdio: 'ignore' });
+    await new Promise(r => setTimeout(r, 500));
+  } catch {}
+
   console.log('[wrapper] Starting OpenClaw gateway...');
   addLog('Starting gateway...');
 
@@ -244,19 +249,26 @@ async function startGateway() {
   }
 }
 
-function stopGateway() {
+async function stopGateway() {
   if (gatewayProcess) {
     console.log('[wrapper] Stopping gateway...');
     addLog('Stopping gateway...');
-    gatewayProcess.kill('SIGTERM');
+    const proc = gatewayProcess;
     gatewayProcess = null;
     gatewayReady = false;
+    proc.kill('SIGTERM');
+    // Wait for the process to fully exit and release port 18789.
+    // Without this, a fast container restart starts a new gateway while the old
+    // one still holds the port, causing the "already listening" crash loop.
+    await new Promise((resolve) => {
+      proc.once('close', resolve);
+      setTimeout(resolve, 4_000).unref?.();
+    });
   }
 }
 
 async function restartGateway() {
-  stopGateway();
-  await new Promise(r => setTimeout(r, 750));
+  await stopGateway();
   await startGateway();
 }
 
@@ -1090,7 +1102,7 @@ app.post('/setup/reset', requireAuth, validateCSRF, async (req, res) => {
     }
 
     // Stop gateway first
-    stopGateway();
+    await stopGateway();
 
     // Remove config file
     const configPath = join(STATE_DIR, 'config.json');
@@ -1131,8 +1143,8 @@ app.post('/setup/gateway/start', requireAuth, validateCSRF, async (req, res) => 
   }
 });
 
-app.post('/setup/gateway/stop', requireAuth, validateCSRF, (req, res) => {
-  stopGateway();
+app.post('/setup/gateway/stop', requireAuth, validateCSRF, async (req, res) => {
+  await stopGateway();
   res.json({ success: true, message: 'Gateway stopped. Your AI assistant is now offline.' });
 });
 
@@ -1343,7 +1355,7 @@ app.get('/setup/backup', requireAuth, async (req, res) => {
 // Backup import
 app.post('/setup/restore', requireAuth, validateCSRF, async (req, res) => {
   try {
-    stopGateway();
+    await stopGateway();
 
     if (existsSync(STATE_DIR)) {
       rmSync(STATE_DIR, { recursive: true, force: true });
@@ -1431,6 +1443,9 @@ proxy.on('error', (err, req, res) => {
 });
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
+  // Strip CSP so injected scripts can run
+  delete proxyRes.headers['content-security-policy'];
+  delete proxyRes.headers['content-security-policy-report-only'];
   const headers = { ...proxyRes.headers };
   const statusCode = proxyRes.statusCode ?? 502;
   const method = String(req.method || 'GET').toUpperCase();
@@ -2732,14 +2747,18 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[wrapper] Received SIGTERM, shutting down...');
-  stopGateway();
-  server.close(() => process.exit(0));
+  stopGateway()
+    .then(() => server.close(() => process.exit(0)))
+    .catch(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5_500).unref?.();
 });
 
 process.on('SIGINT', () => {
   console.log('[wrapper] Received SIGINT, shutting down...');
-  stopGateway();
-  server.close(() => process.exit(0));
+  stopGateway()
+    .then(() => server.close(() => process.exit(0)))
+    .catch(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5_500).unref?.();
 });
 
 // Clean up expired sessions periodically
