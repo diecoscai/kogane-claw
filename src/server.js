@@ -130,7 +130,7 @@ function startOperatorWs() {
           type: 'req',
           id: `op-${++operatorReqId}`,
           method: 'device.pair.approve',
-          params: { requestId },
+          params: { requestId, scopes: DEFAULT_SCOPES },
         }));
         return;
       }
@@ -152,6 +152,15 @@ function startOperatorWs() {
 
 async function initServerDevice() {
   const subtle = webcrypto.subtle;
+
+  if (process.env.RESET_DEVICE === '1' && existsSync(DEVICE_KEY_FILE)) {
+    try {
+      unlinkSync(DEVICE_KEY_FILE);
+      console.log('[ws-proxy] RESET_DEVICE=1 — deleted device key, will generate fresh one');
+    } catch (e) {
+      console.warn('[ws-proxy] RESET_DEVICE: failed to delete device key:', e.message);
+    }
+  }
 
   if (existsSync(DEVICE_KEY_FILE)) {
     try {
@@ -1728,7 +1737,19 @@ server.on('upgrade', (req, socket, head) => {
             if (gatewayWs.readyState === WebSocket.OPEN) gatewayWs.send(JSON.stringify(signed));
           }
         } else if (msg.ok && msg.payload?.type === 'hello-ok') {
-          console.log('[ws-proxy] hello-ok, auth present:', !!msg.payload.auth?.deviceToken, JSON.stringify(msg.payload.auth || null));
+          const proxyAuth = msg.payload.auth;
+          const proxyScopes = proxyAuth?.scopes || [];
+          const proxyScopesOk = proxyScopes.includes('operator.read') && proxyScopes.includes('operator.write');
+          console.log('[ws-proxy] hello-ok, auth present:', !!proxyAuth?.deviceToken, JSON.stringify(proxyAuth || null));
+          if (proxyAuth?.deviceToken && !proxyScopesOk) {
+            console.log('[ws-proxy] scopes missing operator.read/write — resetting device key so next connection pairs fresh');
+            try {
+              if (existsSync(DEVICE_KEY_FILE)) unlinkSync(DEVICE_KEY_FILE);
+              initServerDevice().catch(e => console.error('[ws-proxy] device reinit error:', e.message));
+            } catch (e) {
+              console.error('[ws-proxy] failed to reset device key:', e.message);
+            }
+          }
         } else if (msg.type === 'event' && msg.event?.startsWith('connect')) {
           console.log('[ws-proxy] connect event:', msg.event, JSON.stringify(msg.payload || {}));
         }
